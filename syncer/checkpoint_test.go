@@ -24,6 +24,7 @@ import (
 	"github.com/pingcap/dm/pkg/conn"
 	tcontext "github.com/pingcap/dm/pkg/context"
 	"github.com/pingcap/dm/pkg/retry"
+	"github.com/pingcap/dm/pkg/schema"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	. "github.com/pingcap/check"
@@ -31,27 +32,34 @@ import (
 )
 
 var (
-	cpid               = "test_for_db"
-	schemaCreateSQL    = ""
-	tableCreateSQL     = ""
-	clearCheckPointSQL = ""
-	loadCheckPointSQL  = ""
-	flushCheckPointSQL = ""
+	cpid                = "test_for_db"
+	schemaCreateSQL     = ""
+	tableCreateSQL1     = ""
+	tableCreateSQL2     = ""
+	clearCheckPointSQL1 = ""
+	clearCheckPointSQL2 = ""
+	loadCheckPointSQL   = ""
+	flushCheckPointSQL  = ""
 )
 
 var _ = Suite(&testCheckpointSuite{})
 
 type testCheckpointSuite struct {
-	cfg  *config.SubTaskConfig
-	mock sqlmock.Sqlmock
+	cfg     *config.SubTaskConfig
+	mock    sqlmock.Sqlmock
+	tracker *schema.Tracker
 }
 
 func (s *testCheckpointSuite) SetUpSuite(c *C) {
+	tracker, err := schema.NewTracker()
+	c.Assert(err, IsNil)
+
 	s.cfg = &config.SubTaskConfig{
 		ServerID:   101,
 		MetaSchema: "test",
 		Name:       "syncer_checkpoint_ut",
 	}
+	s.tracker = tracker
 }
 
 func (s *testCheckpointSuite) TearDownSuite(c *C) {
@@ -59,10 +67,12 @@ func (s *testCheckpointSuite) TearDownSuite(c *C) {
 
 func (s *testCheckpointSuite) prepareCheckPointSQL() {
 	schemaCreateSQL = fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS `%s`", s.cfg.MetaSchema)
-	tableCreateSQL = fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s`.`%s_syncer_checkpoint` .*", s.cfg.MetaSchema, s.cfg.Name)
+	tableCreateSQL1 = fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s`.`%s_syncer_checkpoint` .*", s.cfg.MetaSchema, s.cfg.Name)
+	tableCreateSQL2 = fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s`.`%s_syncer_checkpoint_st` .*", s.cfg.MetaSchema, s.cfg.Name)
 	flushCheckPointSQL = fmt.Sprintf("INSERT INTO `%s`.`%s_syncer_checkpoint` .* VALUES.* ON DUPLICATE KEY UPDATE .*", s.cfg.MetaSchema, s.cfg.Name)
-	clearCheckPointSQL = fmt.Sprintf("DELETE FROM `%s`.`%s_syncer_checkpoint` WHERE `id` = '%s'", s.cfg.MetaSchema, s.cfg.Name, cpid)
-	loadCheckPointSQL = fmt.Sprintf("SELECT .* FROM `%s`.`%s_syncer_checkpoint` WHERE `id`='%s'", s.cfg.MetaSchema, s.cfg.Name, cpid)
+	clearCheckPointSQL1 = fmt.Sprintf("DELETE FROM `%s`.`%s_syncer_checkpoint` WHERE id = \\?", s.cfg.MetaSchema, s.cfg.Name)
+	clearCheckPointSQL2 = fmt.Sprintf("DELETE FROM `%s`.`%s_syncer_checkpoint_st` WHERE id = \\?", s.cfg.MetaSchema, s.cfg.Name)
+	loadCheckPointSQL = fmt.Sprintf("SELECT .* FROM `%s`.`%s_syncer_checkpoint` WHERE id = \\?", s.cfg.MetaSchema, s.cfg.Name)
 }
 
 // this test case uses sqlmock to simulate all SQL operations in tests
@@ -84,10 +94,12 @@ func (s *testCheckpointSuite) TestCheckPoint(c *C) {
 	mock.ExpectExec(schemaCreateSQL).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectBegin()
-	mock.ExpectExec(tableCreateSQL).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(tableCreateSQL1).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(tableCreateSQL2).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	mock.ExpectBegin()
-	mock.ExpectExec(clearCheckPointSQL).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(clearCheckPointSQL1).WithArgs(cpid).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(clearCheckPointSQL2).WithArgs(cpid).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	dbConn, err := db.Conn(tcontext.Background().Context())
@@ -97,7 +109,7 @@ func (s *testCheckpointSuite) TestCheckPoint(c *C) {
 	cp.(*RemoteCheckPoint).dbConn = conn
 	err = cp.(*RemoteCheckPoint).prepare()
 	c.Assert(err, IsNil)
-	cp.Clear()
+	c.Assert(cp.Clear(), IsNil)
 
 	// test operation for global checkpoint
 	s.testGlobalCheckPoint(c, cp)
@@ -142,15 +154,15 @@ func (s *testCheckpointSuite) testGlobalCheckPoint(c *C, cp CheckPoint) {
 	s.cfg.Mode = config.ModeAll
 	s.cfg.Dir = dir
 
-	s.mock.ExpectQuery(loadCheckPointSQL).WillReturnRows(sqlmock.NewRows(nil))
+	s.mock.ExpectQuery(loadCheckPointSQL).WithArgs(cpid).WillReturnRows(sqlmock.NewRows(nil))
 	err = cp.Load()
 	c.Assert(err, IsNil)
 	cp.SaveGlobalPoint(pos1)
 
 	s.mock.ExpectBegin()
-	s.mock.ExpectExec(flushCheckPointSQL).WithArgs(cpid, "", "", pos1.Name, pos1.Pos, true, pos1.Name, pos1.Pos).WillReturnResult(sqlmock.NewResult(0, 1))
+	s.mock.ExpectExec(flushCheckPointSQL).WithArgs(cpid, "", "", pos1.Name, pos1.Pos, true).WillReturnResult(sqlmock.NewResult(0, 1))
 	s.mock.ExpectCommit()
-	err = cp.FlushPointsExcept(nil, nil, nil)
+	err = cp.FlushPointsExcept(nil, nil, nil, s.tracker)
 	c.Assert(err, IsNil)
 	c.Assert(cp.GlobalPoint(), Equals, pos1)
 	c.Assert(cp.FlushedGlobalPoint(), Equals, pos1)
@@ -188,9 +200,9 @@ func (s *testCheckpointSuite) testGlobalCheckPoint(c *C, cp CheckPoint) {
 
 	// flush + rollback
 	s.mock.ExpectBegin()
-	s.mock.ExpectExec(flushCheckPointSQL).WithArgs(cpid, "", "", pos2.Name, pos2.Pos, true, pos2.Name, pos2.Pos).WillReturnResult(sqlmock.NewResult(0, 1))
+	s.mock.ExpectExec(flushCheckPointSQL).WithArgs(cpid, "", "", pos2.Name, pos2.Pos, true).WillReturnResult(sqlmock.NewResult(0, 1))
 	s.mock.ExpectCommit()
-	err = cp.FlushPointsExcept(nil, nil, nil)
+	err = cp.FlushPointsExcept(nil, nil, nil, s.tracker)
 	c.Assert(err, IsNil)
 	cp.Rollback()
 	c.Assert(cp.GlobalPoint(), Equals, pos2)
@@ -201,7 +213,7 @@ func (s *testCheckpointSuite) testGlobalCheckPoint(c *C, cp CheckPoint) {
 	pos3.Pos = pos2.Pos + 1000 // > pos2 to enable save
 	cp.SaveGlobalPoint(pos3)
 	columns := []string{"cp_schema", "cp_table", "binlog_name", "binlog_pos", "is_global"}
-	s.mock.ExpectQuery(loadCheckPointSQL).WillReturnRows(sqlmock.NewRows(columns).AddRow("", "", pos2.Name, pos2.Pos, true))
+	s.mock.ExpectQuery(loadCheckPointSQL).WithArgs(cpid).WillReturnRows(sqlmock.NewRows(columns).AddRow("", "", pos2.Name, pos2.Pos, true))
 	err = cp.Load()
 	c.Assert(err, IsNil)
 	c.Assert(cp.GlobalPoint(), Equals, pos2)
@@ -220,7 +232,8 @@ func (s *testCheckpointSuite) testGlobalCheckPoint(c *C, cp CheckPoint) {
 
 	// test clear
 	s.mock.ExpectBegin()
-	s.mock.ExpectExec(clearCheckPointSQL).WillReturnResult(sqlmock.NewResult(0, 1))
+	s.mock.ExpectExec(clearCheckPointSQL1).WithArgs(cpid).WillReturnResult(sqlmock.NewResult(0, 1))
+	s.mock.ExpectExec(clearCheckPointSQL2).WithArgs(cpid).WillReturnResult(sqlmock.NewResult(0, 1))
 	s.mock.ExpectCommit()
 	err = cp.Clear()
 	c.Assert(err, IsNil)
@@ -270,9 +283,9 @@ func (s *testCheckpointSuite) testTableCheckPoint(c *C, cp CheckPoint) {
 
 	// flush + rollback
 	s.mock.ExpectBegin()
-	s.mock.ExpectExec(flushCheckPointSQL).WithArgs(cpid, schema, table, pos2.Name, pos2.Pos, false, pos2.Name, pos2.Pos).WillReturnResult(sqlmock.NewResult(0, 1))
+	s.mock.ExpectExec(flushCheckPointSQL).WithArgs(cpid, schema, table, pos2.Name, pos2.Pos, false).WillReturnResult(sqlmock.NewResult(0, 1))
 	s.mock.ExpectCommit()
-	err = cp.FlushPointsExcept(nil, nil, nil)
+	err = cp.FlushPointsExcept(nil, nil, nil, s.tracker)
 	c.Assert(err, IsNil)
 	cp.Rollback()
 	newer = cp.IsNewerTablePoint(schema, table, pos1)
@@ -280,7 +293,8 @@ func (s *testCheckpointSuite) testTableCheckPoint(c *C, cp CheckPoint) {
 
 	// clear, to min
 	s.mock.ExpectBegin()
-	s.mock.ExpectExec(clearCheckPointSQL).WillReturnResult(sqlmock.NewResult(0, 1))
+	s.mock.ExpectExec(clearCheckPointSQL1).WithArgs(cpid).WillReturnResult(sqlmock.NewResult(0, 1))
+	s.mock.ExpectExec(clearCheckPointSQL2).WithArgs(cpid).WillReturnResult(sqlmock.NewResult(0, 1))
 	s.mock.ExpectCommit()
 	err = cp.Clear()
 	c.Assert(err, IsNil)
@@ -306,9 +320,9 @@ func (s *testCheckpointSuite) testTableCheckPoint(c *C, cp CheckPoint) {
 
 	// flush but except + rollback
 	s.mock.ExpectBegin()
-	s.mock.ExpectExec(flushCheckPointSQL).WithArgs(cpid, "", "", pos2.Name, pos2.Pos, true, pos2.Name, pos2.Pos).WillReturnResult(sqlmock.NewResult(0, 1))
+	s.mock.ExpectExec(flushCheckPointSQL).WithArgs(cpid, "", "", pos2.Name, pos2.Pos, true).WillReturnResult(sqlmock.NewResult(0, 1))
 	s.mock.ExpectCommit()
-	err = cp.FlushPointsExcept([][]string{{schema, table}}, nil, nil)
+	err = cp.FlushPointsExcept([][]string{{schema, table}}, nil, nil, s.tracker)
 	c.Assert(err, IsNil)
 	cp.Rollback()
 	newer = cp.IsNewerTablePoint(schema, table, pos1)

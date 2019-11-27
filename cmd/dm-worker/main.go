@@ -28,6 +28,7 @@ import (
 	"github.com/pingcap/dm/pkg/utils"
 
 	"github.com/pingcap/errors"
+	pclog "github.com/pingcap/log"
 	"go.uber.org/zap"
 )
 
@@ -64,6 +65,9 @@ func main() {
 		syscall.SIGINT,
 		syscall.SIGTERM,
 		syscall.SIGQUIT)
+
+	// Suppress unnecessary TiDB log from the schema tracker
+	pclog.SetLevel(zap.ErrorLevel)
 
 	s := worker.NewServer(cfg)
 

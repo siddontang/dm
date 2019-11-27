@@ -14,6 +14,7 @@
 package syncer
 
 import (
+	"encoding/json"
 	"fmt"
 	"path"
 	"sync"
@@ -23,10 +24,14 @@ import (
 	"github.com/pingcap/dm/pkg/conn"
 	tcontext "github.com/pingcap/dm/pkg/context"
 	"github.com/pingcap/dm/pkg/log"
+	"github.com/pingcap/dm/pkg/schema"
 	"github.com/pingcap/dm/pkg/terror"
 	"github.com/pingcap/dm/pkg/utils"
+	"github.com/pingcap/tidb-tools/pkg/dbutil"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/parser/model"
 	tmysql "github.com/pingcap/parser/mysql"
 	"github.com/siddontang/go-mysql/mysql"
 	"go.uber.org/zap"
@@ -137,14 +142,23 @@ type CheckPoint interface {
 	// Load loads all checkpoints saved by CheckPoint
 	Load() error
 
+	// Load loads all schemas saved by CheckPoint into the schema tracker.
+	LoadSchemas(schemaTracker *schema.Tracker) error
+
 	// LoadMeta loads checkpoints from meta config item or file
 	LoadMeta() error
 
 	// SaveTablePoint saves checkpoint for specified table in memory
 	SaveTablePoint(sourceSchema, sourceTable string, pos mysql.Position)
 
+	// SaveSchemaChanged saves a record in memory about the schema of the table has changed
+	SaveSchemaChanged(sourceSchema, sourceTable string)
+
 	// DeleteTablePoint deletes checkpoint for specified table in memory and storage
 	DeleteTablePoint(sourceSchema, sourceTable string) error
+
+	// DeleteDatabasePoint deletes checkpoint for specified schema
+	DeleteDatabasePoint(sourceSchema string) error
 
 	// IsNewerTablePoint checks whether job's checkpoint is newer than previous saved checkpoint
 	IsNewerTablePoint(sourceSchema, sourceTable string, pos mysql.Position) bool
@@ -158,7 +172,12 @@ type CheckPoint interface {
 	// by extraSQLs and extraArgs. Currently extraSQLs contain shard meta only.
 	// @exceptTables: [[schema, table]... ]
 	// corresponding to Meta.Flush
-	FlushPointsExcept(exceptTables [][]string, extraSQLs []string, extraArgs [][]interface{}) error
+	FlushPointsExcept(
+		exceptTables [][]string,
+		extraSQLs []string,
+		extraArgs [][]interface{},
+		schemaTracker *schema.Tracker,
+	) error
 
 	// GlobalPoint returns the global binlog stream's checkpoint
 	// corresponding to to Meta.Pos
@@ -179,6 +198,11 @@ type CheckPoint interface {
 	String() string
 }
 
+type tablePoint struct {
+	binlog          *binlogPoint
+	hasSchemaChange bool
+}
+
 // RemoteCheckPoint implements CheckPoint
 // which using target database to store info
 // NOTE: now we sync from relay log, so not add GTID support yet
@@ -188,15 +212,16 @@ type RemoteCheckPoint struct {
 
 	cfg *config.SubTaskConfig
 
-	db     *conn.BaseDB
-	dbConn *DBConn
-	schema string // schema name, set through task config
-	table  string // table name, now it's task name
-	id     string // checkpoint ID, now it is `source-id`
+	db                 *conn.BaseDB
+	dbConn             *DBConn
+	schema             string // schema name, set through task config
+	table              string // table name, now it's task name
+	schemaTrackerTable string
+	id                 string // checkpoint ID, now it is `source-id`
 
 	// source-schema -> source-table -> checkpoint
 	// used to filter the synced binlog when re-syncing for sharding group
-	points map[string]map[string]*binlogPoint
+	points map[string]map[string]tablePoint
 
 	// global binlog checkpoint
 	// after restarted, we can continue to re-sync from this point
@@ -212,17 +237,18 @@ type RemoteCheckPoint struct {
 
 // NewRemoteCheckPoint creates a new RemoteCheckPoint
 func NewRemoteCheckPoint(tctx *tcontext.Context, cfg *config.SubTaskConfig, id string) CheckPoint {
-
 	newtctx := tctx.WithLogger(tctx.L().WithFields(zap.String("component", "remote checkpoint")))
 
+	baseTableName := cfg.Name + "_syncer_checkpoint"
 	cp := &RemoteCheckPoint{
-		cfg:         cfg,
-		schema:      cfg.MetaSchema,
-		table:       fmt.Sprintf("%s_syncer_checkpoint", cfg.Name),
-		id:          id,
-		points:      make(map[string]map[string]*binlogPoint),
-		globalPoint: newBinlogPoint(minCheckpoint, minCheckpoint),
-		tctx:        newtctx,
+		cfg:                cfg,
+		schema:             cfg.MetaSchema,
+		table:              baseTableName,
+		schemaTrackerTable: baseTableName + "_st",
+		id:                 id,
+		points:             make(map[string]map[string]tablePoint),
+		globalPoint:        newBinlogPoint(minCheckpoint, minCheckpoint),
+		tctx:               newtctx,
 	}
 
 	return cp
@@ -258,18 +284,29 @@ func (cp *RemoteCheckPoint) Clear() error {
 	defer cp.Unlock()
 
 	// delete all checkpoints
-	sql2 := fmt.Sprintf("DELETE FROM `%s`.`%s` WHERE `id` = '%s'", cp.schema, cp.table, cp.id)
-	args := make([]interface{}, 0)
-	_, err := cp.dbConn.executeSQL(cp.tctx, []string{sql2}, [][]interface{}{args}...)
+	args := []interface{}{cp.id}
+	_, err := cp.dbConn.executeSQL(cp.tctx, []string{
+		`DELETE FROM ` + dbutil.TableName(cp.schema, cp.table) + ` WHERE id = ?`,
+		`DELETE FROM ` + dbutil.TableName(cp.schema, cp.schemaTrackerTable) + ` WHERE id = ?`,
+	}, args, args)
 	if err != nil {
 		return err
 	}
 
 	cp.globalPoint = newBinlogPoint(minCheckpoint, minCheckpoint)
 
-	cp.points = make(map[string]map[string]*binlogPoint)
+	cp.points = make(map[string]map[string]tablePoint)
 
 	return nil
+}
+
+func (cp *RemoteCheckPoint) getDBPoint(sourceSchema string) map[string]tablePoint {
+	mSchema, ok := cp.points[sourceSchema]
+	if !ok {
+		mSchema = make(map[string]tablePoint)
+		cp.points[sourceSchema] = mSchema
+	}
+	return mSchema
 }
 
 // SaveTablePoint implements CheckPoint.SaveTablePoint
@@ -287,19 +324,27 @@ func (cp *RemoteCheckPoint) saveTablePoint(sourceSchema, sourceTable string, pos
 
 	// we save table checkpoint while we meet DDL or DML
 	cp.tctx.L().Debug("save table checkpoint", zap.Stringer("position", pos), zap.String("schema", sourceSchema), zap.String("table", sourceTable))
-	mSchema, ok := cp.points[sourceSchema]
-	if !ok {
-		mSchema = make(map[string]*binlogPoint)
-		cp.points[sourceSchema] = mSchema
-	}
-	point, ok := mSchema[sourceTable]
-	if !ok {
-		mSchema[sourceTable] = newBinlogPoint(pos, minCheckpoint)
+	mSchema := cp.getDBPoint(sourceSchema)
+	tp, ok := mSchema[sourceTable]
+	if !ok || tp.binlog == nil {
+		tp.binlog = newBinlogPoint(pos, minCheckpoint)
+		mSchema[sourceTable] = tp
 	} else {
-		if err := point.save(pos); err != nil {
+		if err := tp.binlog.save(pos); err != nil {
 			cp.tctx.L().Error("fail to save table point", zap.String("schema", sourceSchema), zap.String("table", sourceTable), log.ShortError(err))
 		}
 	}
+}
+
+// SaveSchemaChanged implements CheckPoint.SaveSchemaChanged
+func (cp *RemoteCheckPoint) SaveSchemaChanged(sourceSchema, sourceTable string) {
+	cp.tctx.L().Debug("save schema changed", zap.String("schema", sourceSchema), zap.String("table", sourceTable))
+	cp.Lock()
+	defer cp.Unlock()
+	mSchema := cp.getDBPoint(sourceSchema)
+	tp, _ := mSchema[sourceTable]
+	tp.hasSchemaChange = true
+	mSchema[sourceTable] = tp
 }
 
 // DeleteTablePoint implements CheckPoint.DeleteTablePoint
@@ -317,13 +362,40 @@ func (cp *RemoteCheckPoint) DeleteTablePoint(sourceSchema, sourceTable string) e
 
 	cp.tctx.L().Info("delete table checkpoint", zap.String("schema", sourceSchema), zap.String("table", sourceTable))
 	// delete  checkpoint
-	sql2 := fmt.Sprintf("DELETE FROM `%s`.`%s` WHERE `id` = '%s' AND `cp_schema` = '%s' AND `cp_table` = '%s'", cp.schema, cp.table, cp.id, sourceSchema, sourceTable)
-	args := make([]interface{}, 0)
-	_, err := cp.dbConn.executeSQL(cp.tctx, []string{sql2}, [][]interface{}{args}...)
+	sqls := []string{
+		`DELETE FROM ` + dbutil.TableName(cp.schema, cp.table) + ` WHERE id = ? AND cp_schema = ? AND cp_table = ?`,
+		`DELETE FROM ` + dbutil.TableName(cp.schema, cp.schemaTrackerTable) + ` WHERE id = ? AND cp_schema = ? AND cp_table = ?`,
+	}
+	args := []interface{}{cp.id, sourceSchema, sourceTable}
+	_, err := cp.dbConn.executeSQL(cp.tctx, sqls, args, args)
 	if err != nil {
 		return err
 	}
 	delete(mSchema, sourceTable)
+	return nil
+}
+
+// DeleteDatabasePoint implements CheckPoint.DeleteDatabasePoint
+func (cp *RemoteCheckPoint) DeleteDatabasePoint(sourceSchema string) error {
+	cp.Lock()
+	defer cp.Unlock()
+
+	if _, ok := cp.points[sourceSchema]; !ok {
+		return nil
+	}
+
+	cp.tctx.L().Info("delete database checkpoint", zap.String("schema", sourceSchema))
+	// delete  checkpoint
+	sqls := []string{
+		`DELETE FROM ` + dbutil.TableName(cp.schema, cp.table) + ` WHERE id = ? AND cp_schema = ?`,
+		`DELETE FROM ` + dbutil.TableName(cp.schema, cp.schemaTrackerTable) + ` WHERE id = ? AND cp_schema = ?`,
+	}
+	args := []interface{}{cp.id, sourceSchema}
+	_, err := cp.dbConn.executeSQL(cp.tctx, sqls, args, args)
+	if err != nil {
+		return err
+	}
+	delete(cp.points, sourceSchema)
 	return nil
 }
 
@@ -335,11 +407,11 @@ func (cp *RemoteCheckPoint) IsNewerTablePoint(sourceSchema, sourceTable string, 
 	if !ok {
 		return true
 	}
-	point, ok := mSchema[sourceTable]
-	if !ok {
+	tp, ok := mSchema[sourceTable]
+	if !ok || tp.binlog == nil {
 		return true
 	}
-	oldPos := point.MySQLPos()
+	oldPos := tp.binlog.MySQLPos()
 	return pos.Compare(oldPos) > 0
 }
 
@@ -355,7 +427,12 @@ func (cp *RemoteCheckPoint) SaveGlobalPoint(pos mysql.Position) {
 }
 
 // FlushPointsExcept implements CheckPoint.FlushPointsExcept
-func (cp *RemoteCheckPoint) FlushPointsExcept(exceptTables [][]string, extraSQLs []string, extraArgs [][]interface{}) error {
+func (cp *RemoteCheckPoint) FlushPointsExcept(
+	exceptTables [][]string,
+	extraSQLs []string,
+	extraArgs [][]interface{},
+	tracker *schema.Tracker,
+) error {
 	cp.RLock()
 	defer cp.RUnlock()
 
@@ -384,19 +461,33 @@ func (cp *RemoteCheckPoint) FlushPointsExcept(exceptTables [][]string, extraSQLs
 	points := make([]*binlogPoint, 0, 100)
 
 	for schema, mSchema := range cp.points {
-		for table, point := range mSchema {
+		for table, tp := range mSchema {
 			if _, ok1 := excepts[schema]; ok1 {
 				if _, ok2 := excepts[schema][table]; ok2 {
 					continue
 				}
 			}
-			if point.outOfDate() {
+			if point := tp.binlog; point != nil && point.outOfDate() {
 				pos := point.MySQLPos()
 				sql2, arg := cp.genUpdateSQL(schema, table, pos.Name, pos.Pos, false)
 				sqls = append(sqls, sql2)
 				args = append(args, arg)
 
 				points = append(points, point)
+			}
+			if tp.hasSchemaChange {
+				sql2, arg, err := cp.genUpdateSchemaTrackerSQL(schema, table, tracker)
+				if err != nil {
+					cp.tctx.L().Warn("skipping schema tracker checkpoint due to error",
+						zap.String("schema", schema),
+						zap.String("table", table),
+						log.ShortError(err))
+				} else {
+					tp.hasSchemaChange = false
+					mSchema[table] = tp
+					sqls = append(sqls, sql2)
+					args = append(args, arg)
+				}
 			}
 		}
 	}
@@ -447,9 +538,11 @@ func (cp *RemoteCheckPoint) Rollback() {
 	defer cp.RUnlock()
 	cp.globalPoint.rollback()
 	for schema, mSchema := range cp.points {
-		for table, point := range mSchema {
-			cp.tctx.L().Info("rollback checkpoint", log.WrapStringerField("checkpoint", point), zap.String("schema", schema), zap.String("table", table))
-			point.rollback()
+		for table, tp := range mSchema {
+			if point := tp.binlog; point != nil {
+				cp.tctx.L().Info("rollback checkpoint", log.WrapStringerField("checkpoint", point), zap.String("schema", schema), zap.String("table", table))
+				point.rollback()
+			}
 		}
 	}
 }
@@ -474,8 +567,8 @@ func (cp *RemoteCheckPoint) createSchema() error {
 }
 
 func (cp *RemoteCheckPoint) createTable() error {
-	tableName := fmt.Sprintf("`%s`.`%s`", cp.schema, cp.table)
-	sql2 := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+	sqls := []string{
+		`CREATE TABLE IF NOT EXISTS ` + dbutil.TableName(cp.schema, cp.table) + ` (
 			id VARCHAR(32) NOT NULL,
 			cp_schema VARCHAR(128) NOT NULL,
 			cp_table VARCHAR(128) NOT NULL,
@@ -485,17 +578,26 @@ func (cp *RemoteCheckPoint) createTable() error {
 			create_time timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			update_time timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			UNIQUE KEY uk_id_schema_table (id, cp_schema, cp_table)
-		)`, tableName)
-	args := make([]interface{}, 0)
-	_, err := cp.dbConn.executeSQL(cp.tctx, []string{sql2}, [][]interface{}{args}...)
-	cp.tctx.L().Info("create checkpoint table", zap.String("statement", sql2))
+		)`,
+		`CREATE TABLE IF NOT EXISTS ` + dbutil.TableName(cp.schema, cp.schemaTrackerTable) + ` (
+			id VARCHAR(32) NOT NULL,
+			cp_schema VARCHAR(128) NOT NULL,
+			cp_table VARCHAR(128) NOT NULL,
+			table_info JSON NOT NULL,
+			create_time timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			update_time timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+			UNIQUE KEY uk_id_schema_table (id, cp_schema, cp_table)
+		)`,
+	}
+	_, err := cp.dbConn.executeSQL(cp.tctx, sqls)
+	cp.tctx.L().Info("create checkpoint table", zap.Strings("statements", sqls))
 	return err
 }
 
 // Load implements CheckPoint.Load
 func (cp *RemoteCheckPoint) Load() error {
-	query := fmt.Sprintf("SELECT `cp_schema`, `cp_table`, `binlog_name`, `binlog_pos`, `is_global` FROM `%s`.`%s` WHERE `id`='%s'", cp.schema, cp.table, cp.id)
-	rows, err := cp.dbConn.querySQL(cp.tctx, query)
+	query := `SELECT cp_schema, cp_table, binlog_name, binlog_pos, is_global FROM ` + dbutil.TableName(cp.schema, cp.table) + ` WHERE id = ?`
+	rows, err := cp.dbConn.querySQL(cp.tctx, query, cp.id)
 	defer func() {
 		if rows != nil {
 			rows.Close()
@@ -536,13 +638,47 @@ func (cp *RemoteCheckPoint) Load() error {
 			}
 			continue // skip global checkpoint
 		}
-		mSchema, ok := cp.points[cpSchema]
-		if !ok {
-			mSchema = make(map[string]*binlogPoint)
-			cp.points[cpSchema] = mSchema
-		}
-		mSchema[cpTable] = newBinlogPoint(pos, pos)
+		mSchema := cp.getDBPoint(cpSchema)
+		mSchema[cpTable] = tablePoint{binlog: newBinlogPoint(pos, pos)}
 	}
+
+	return terror.WithScope(terror.DBErrorAdapt(rows.Err(), terror.ErrDBDriverError), terror.ScopeDownstream)
+}
+
+// LoadSchemas implements CheckPoint.LoadSchemas
+func (cp *RemoteCheckPoint) LoadSchemas(tracker *schema.Tracker) error {
+	query := `SELECT cp_schema, cp_table, table_info FROM ` + dbutil.TableName(cp.schema, cp.schemaTrackerTable) + ` WHERE id = ?`
+	rows, err := cp.dbConn.querySQL(cp.tctx, query, cp.id)
+	if err != nil {
+		return terror.WithScope(err, terror.ScopeDownstream)
+	}
+	defer rows.Close()
+
+	var (
+		cpSchema  string
+		cpTable   string
+		tableInfo []byte
+	)
+	for rows.Next() {
+		err = rows.Scan(&cpSchema, &cpTable, &tableInfo)
+		if err != nil {
+			return terror.WithScope(terror.DBErrorAdapt(err, terror.ErrDBDriverError), terror.ScopeDownstream)
+		}
+
+		var ti model.TableInfo
+		if err = json.Unmarshal(tableInfo, &ti); err != nil {
+			return errors.Annotatef(err, "saved schema of %s.%s is not proper JSON", cpSchema, cpTable)
+		}
+
+		if err = tracker.CreateSchemaIfNotExists(cpSchema); err != nil {
+			return errors.Annotatef(err, "failed to create database for `%s` in schema tracker", cpSchema)
+		}
+
+		if err = tracker.CreateTableIfNotExists(cpSchema, cpTable, &ti); err != nil {
+			return errors.Annotatef(err, "failed to create table for `%s`.`%s` in schema tracker", cpSchema, cpTable)
+		}
+	}
+
 	return terror.WithScope(terror.DBErrorAdapt(rows.Err(), terror.ErrDBDriverError), terror.ScopeDownstream)
 }
 
@@ -588,14 +724,39 @@ func (cp *RemoteCheckPoint) LoadMeta() error {
 func (cp *RemoteCheckPoint) genUpdateSQL(cpSchema, cpTable string, binlogName string, binlogPos uint32, isGlobal bool) (string, []interface{}) {
 	// use `INSERT INTO ... ON DUPLICATE KEY UPDATE` rather than `REPLACE INTO`
 	// to keep `create_time`, `update_time` correctly
-	sql2 := fmt.Sprintf("INSERT INTO `%s`.`%s` (`id`, `cp_schema`, `cp_table`, `binlog_name`, `binlog_pos`, `is_global`) VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE `binlog_name`=?, `binlog_pos`=?",
-		cp.schema, cp.table)
+	sql2 := `INSERT INTO ` + dbutil.TableName(cp.schema, cp.table) + `
+		(id, cp_schema, cp_table, binlog_name, binlog_pos, is_global) VALUES
+		(?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE binlog_name = VALUES(binlog_name), binlog_pos = VALUES(binlog_pos);
+	`
+
 	if isGlobal {
 		cpSchema = globalCpSchema
 		cpTable = globalCpTable
 	}
-	args := []interface{}{cp.id, cpSchema, cpTable, binlogName, binlogPos, isGlobal, binlogName, binlogPos}
+
+	args := []interface{}{cp.id, cpSchema, cpTable, binlogName, binlogPos, isGlobal}
 	return sql2, args
+}
+
+func (cp *RemoteCheckPoint) genUpdateSchemaTrackerSQL(cpSchema, cpTable string, tracker *schema.Tracker) (string, []interface{}, error) {
+	ti, err := tracker.GetTable(cpSchema, cpTable)
+	if err != nil {
+		return "", nil, err
+	}
+
+	tableInfo, err := json.Marshal(ti)
+	if err != nil {
+		return "", nil, err
+	}
+
+	sql2 := `INSERT INTO ` + dbutil.TableName(cp.schema, cp.schemaTrackerTable) + `
+		(id, cp_schema, cp_table, table_info) VALUES
+		(?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE table_info = VALUES(table_info);
+	`
+	args := []interface{}{cp.id, cpSchema, cpTable, tableInfo}
+	return sql2, args, nil
 }
 
 func (cp *RemoteCheckPoint) parseMetaData() (*mysql.Position, error) {
